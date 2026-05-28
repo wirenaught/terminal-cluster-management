@@ -7,6 +7,9 @@ history log — all bound together and auto-restored across shell restarts.
 If you regularly juggle several pieces of work in parallel and lose track of
 which terminal tabs belong to which task, this is for you.
 
+For the conceptual framing — what a cluster is and what problem it solves — see
+[CONCEPT.md](./CONCEPT.md).
+
 ---
 
 ## What's a "cluster"?
@@ -76,11 +79,11 @@ That's it. Read on for the full command set and workflows.
 
 | Command | What it does |
 |---|---|
-| `cluster-init [name]` | Create a new cluster dir, start a named tmux session, open `notes.txt`, attach |
+| `cluster-init [slug]` | Create a new cluster dir, start a named tmux session, open `notes.txt`, attach |
 | `cluster-join [dir]` | Join a cluster in the **current shell only** (sets `$CLUSTER_DIR`, no tmux). Defaults to most recent cluster |
 | `cluster-activate [name-fragment]` | Like `cluster-join`, but interactive picker when no arg is given. Use before `cluster-reopen` |
 | `cluster-reopen [name-fragment]` | Attach to the tmux session for the active or named cluster. Creates a fresh session if continuum hasn't restored one |
-| `cluster-shutdown` | Kill the active cluster's tmux session. Notes and history are preserved on disk |
+| `cluster-shutdown` | Kill the active cluster's tmux session and clear `$CLUSTER_DIR` + the auto-restore state file. Notes and history are preserved on disk |
 | `cluster-list` | List all clusters under `~/.clusters/`, most recent first |
 | `cluster-status` | Show active cluster and whether its tmux session is running |
 | `cluster-history` | Print the active cluster's `history.log` |
@@ -93,7 +96,8 @@ That's it. Read on for the full command set and workflows.
 
 `cluster-init` names the cluster `YYYY-MM-DD-HHMM` plus an optional `-slug`,
 e.g. `2026-05-25-1430-auth-bug`. The directory basename **is** the tmux session
-name — that's what `tmux-resurrect` saves, and what `cluster-reopen` greps for.
+name — that's what `tmux-resurrect` saves. `cluster-reopen` greps your query
+against the full cluster paths output by `ls -td ~/.clusters/*/`.
 
 Anywhere a command takes `[name-fragment]`, it does a substring match against
 the directory basename and picks the most recent hit. Use enough characters to
@@ -299,9 +303,11 @@ history are intact. Re-open whatever windows you need with `nn`.
 **The prompt isn't showing the cluster name**
 Check `echo $CLUSTER_DIR`. If empty, the auto-restore didn't fire (state file
 missing, or its target directory is gone). Run `cluster-activate <fragment>`
-to pick one. If `CLUSTER_DIR` is set but the prompt is blank, confirm
-`setopt PROMPT_SUBST` is in effect — another `.zshrc` line may be overwriting
-`PROMPT` after `cluster.zsh` is sourced.
+to pick one. If the target directory was deleted out from under it, the stale
+state file at `~/.config/cluster/last-cluster` is left in place — clear it
+with `rm ~/.config/cluster/last-cluster`. If `CLUSTER_DIR` is set but the
+prompt is blank, confirm `setopt PROMPT_SUBST` is in effect — another
+`.zshrc` line may be overwriting `PROMPT` after `cluster.zsh` is sourced.
 
 **`nn` opens a new window outside the cluster**
 You're outside tmux *and* outside iTerm2/Apple Terminal. `nn` only knows how
@@ -329,6 +335,8 @@ in `notes`). Anything that opens a file works.
 ```
 .
 ├── cluster.zsh        # the script (source this from ~/.zshrc)
+├── CONCEPT.md         # the "why" — what a cluster is and what it's for
+├── concept.svg        # diagram embedded in CONCEPT.md
 ├── INSTALL.md         # setup instructions
 └── README.md          # this file
 ```
