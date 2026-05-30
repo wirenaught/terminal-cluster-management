@@ -263,6 +263,10 @@ function cluster-rename() {
     echo "cluster-rename: '$new_name' already exists" >&2
     return 1
   fi
+  if tmux has-session -t "$new_name" 2>/dev/null; then
+    echo "cluster-rename: tmux session '$new_name' already exists" >&2
+    return 1
+  fi
 
   # Step 3: mv first — abort before touching anything else on failure
   mv "$CLUSTER_DIR" "$new_dir" || {
