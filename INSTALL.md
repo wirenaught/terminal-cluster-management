@@ -60,6 +60,9 @@ bind-key C-a send-prefix
 
 # ── general behavior ──────────────────────────────────────────────────────────
 set -g mouse on                   # mouse resize/click panes and windows
+set -g set-clipboard on           # OSC 52: mouse-drag selection → system clipboard
+                                  # (requires iTerm prefs → General → Selection
+                                  # → "Applications in terminal may access clipboard")
 set -g history-limit 50000        # scrollback buffer
 set -g display-time 4000          # status message display duration (ms)
 set -g focus-events on            # pass focus events to apps (vim, etc.)
@@ -73,6 +76,15 @@ bind c new-window -c "#{pane_current_path}"       # new window in same dir
 bind '"' split-window -c "#{pane_current_path}"   # split horizontal, same dir
 bind % split-window -h -c "#{pane_current_path}"  # split vertical, same dir
 bind R source-file ~/.tmux.conf \; display-message "tmux.conf reloaded"
+
+# ── clipboard ─────────────────────────────────────────────────────────────────
+# Mouse drag-release: pipe selection straight to pbcopy. Works in any terminal
+# (iTerm, Terminal.app, etc.) — does not rely on OSC 52. -no-clear keeps the
+# highlight visible after release (press q to dismiss copy-mode).
+# Bound in both copy-mode tables so it fires whether mode-keys is emacs (default)
+# or vi.
+bind-key -T copy-mode    MouseDragEnd1Pane send-keys -X copy-pipe-no-clear "pbcopy"
+bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-no-clear "pbcopy"
 
 # ── window title (shown in iTerm2 window/tab title bar) ──────────────────────
 set -g set-titles on
@@ -134,6 +146,35 @@ Verify:
 ls ~/.tmux/plugins/
 # tmux-continuum  tmux-resurrect  tpm
 ```
+
+### Clipboard: terminal-specific notes
+
+The tmux.conf above uses **two** mechanisms to push mouse-drag selections to
+the system clipboard:
+
+- **`copy-pipe-no-clear "pbcopy"` binding** — works everywhere `pbcopy` is on
+  PATH (any local macOS terminal). This is the primary path.
+- **`set -g set-clipboard on`** — emits OSC 52 escape sequences so a tmux
+  session running on a remote host (via SSH) can also reach your local
+  clipboard, provided the local terminal honors OSC 52.
+
+**iTerm2** honors OSC 52 only if you opt in:
+**iTerm2 → Settings → General → Selection →
+✓ "Applications in terminal may access clipboard"**
+Without this, the `pbcopy` binding still works for local sessions; the
+checkbox only matters for SSH'd-in remote-tmux scenarios.
+
+**Terminal.app** does not support OSC 52 at all (Apple has never implemented
+it). For local sessions, the `pbcopy` binding handles it. For SSH'd-in remote
+tmux, the remote selection won't reach your Mac's clipboard — switch to
+iTerm2 (with the checkbox on) if you need that.
+
+**Bypassing tmux selection.** To select across pane borders (or anywhere
+tmux's mouse capture gets in the way), hold a modifier while dragging:
+- **iTerm2:** hold **⌥ (Option)** — drags become native iTerm selections.
+- **Terminal.app:** hold **Fn** — drags become native Terminal selections.
+
+In both cases use Edit → Copy or ⌘C to copy the native selection.
 
 ---
 
@@ -241,8 +282,7 @@ The status bar at the bottom of the tmux window shows:
 │   ├── tmux-resurrect/               # session save/restore
 │   └── tmux-continuum/               # automatic saves every 1 min
 ~/.config/cluster/
-│   ├── cluster.zsh                   # all cluster functions
-│   └── last-cluster                  # persisted active cluster path
+│   └── cluster.zsh                   # all cluster functions
 ~/.clusters/                          # one directory per cluster session
 │   └── <timestamp>-<name>/
 │       ├── notes.txt                 # shared scratchpad
@@ -268,11 +308,11 @@ iTerm2 or Terminal.app window.
 
 **Status bar not visible**
 The tmux status bar only appears inside an attached tmux session. Run
-`cluster-init` or `cluster-reopen` to enter one.
+`cluster-init` or `cluster-join` to enter one.
 
 **`Ctrl-a R` gives `bck-i-search:` or does nothing**
 You are not inside a tmux session. `Ctrl-a` is intercepted by zsh outside
-tmux. Enter a cluster session first with `cluster-reopen`.
+tmux. Enter a cluster session first with `cluster-join`.
 
 **tmux-continuum not saving**
 Check the last save timestamp:
@@ -281,11 +321,12 @@ tmux show-options -gv @continuum-save-last-timestamp
 ```
 If empty, reload tmux config from inside a session with `Ctrl-a R`.
 
-**After reboot, cluster not auto-restored**
-Check the state file:
+**After reboot, no cluster active in new shells**
+That's by design — new shells don't auto-restore. To resume:
 ```zsh
-cat ~/.config/cluster/last-cluster
+cluster-list          # see what's on disk
+cluster-join          # pick one and attach
 ```
-If it points to a directory that exists, `source ~/.zshrc` should restore it.
-If the tmux session was not continuum-saved before the reboot, run
-`cluster-reopen` to create a fresh session for that cluster.
+If `cluster-join` reports the tmux session isn't running, continuum didn't
+save it before the reboot. Resurrect with `tmux new-session -d -s <name>`
+then `cluster-join`, or `cluster-init` a fresh cluster.

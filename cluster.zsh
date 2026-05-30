@@ -2,7 +2,29 @@
 # Source this file from ~/.zshrc
 
 CLUSTER_BASE="$HOME/.clusters"
-CLUSTER_STATE="$HOME/.config/cluster/last-cluster"
+
+# Path to this file, captured at source time. cluster-help parses it to
+# build the command listing from the section-header / Usage convention.
+typeset -g _CLUSTER_ZSH_PATH="${${(%):-%x}:A}"
+
+# Default geometry for detached tmux sessions created by cluster-init / cluster-join.
+CLUSTER_TMUX_GEOMETRY=(-x 220 -y 50)
+
+# ── output conventions ───────────────────────────────────────────────────────
+# Errors:   "<cmd>: <message>"            → stderr
+# Info:     plain "key:  value" lines     → stdout, no command prefix
+# Summary block used after init/join/rename/status/shutdown:
+#   cluster:  <name>
+#   path:     <dir>
+#   tmux:     <starting|running|created|stopped|not running>
+#   notes:    <path>           (init only)
+function _cluster_print_summary() {
+  local name="$1" dir="$2" tmux_state="$3" notes_path="${4:-}"
+  printf "cluster:  %s\n" "$name"
+  printf "path:     %s\n" "$dir"
+  printf "tmux:     %s\n" "$tmux_state"
+  [[ -n "$notes_path" ]] && printf "notes:    %s\n" "$notes_path"
+}
 
 # ── prompt ────────────────────────────────────────────────────────────────────
 # Shows: [cluster-name] user@host path %
@@ -21,12 +43,11 @@ function _cluster_prompt_segment() {
 PROMPT=$'$(_cluster_prompt_segment)%F{green}%n@%m%f %F{yellow}%~%f\n%F{cyan}❯%f '
 
 # ── _cluster_activate (internal) ─────────────────────────────────────────────
-# Set CLUSTER_DIR and persist it to the state file
+# Set CLUSTER_DIR for this shell. Activation is shell-local — no persistent
+# state file. New shells are not in a cluster until they explicitly join.
 function _cluster_activate() {
   local dir="$1"
   export CLUSTER_DIR="$dir"
-  mkdir -p "${CLUSTER_STATE:h}"
-  echo "$dir" > "$CLUSTER_STATE"
 }
 
 # Source a cluster's join.sh, refusing if the file is missing. Returns 1 on
@@ -39,19 +60,6 @@ function _cluster_source_join() {
   fi
   source "$dir/join.sh"
 }
-
-# ── auto-restore on shell startup ────────────────────────────────────────────
-# Silently re-activate the last cluster if the directory still exists.
-# This runs when the file is sourced (i.e. every new shell via .zshrc).
-if [[ -z "$CLUSTER_DIR" && -f "$CLUSTER_STATE" ]]; then
-  _last="$(cat "$CLUSTER_STATE")"
-  if [[ -d "$_last" ]]; then
-    export CLUSTER_DIR="$_last"
-  else
-    rm -f "$CLUSTER_STATE"
-  fi
-  unset _last
-fi
 
 # ── cluster-init ─────────────────────────────────────────────────────────────
 # Usage: cluster-init [slug]
@@ -73,8 +81,10 @@ function cluster-init() {
 export CLUSTER_DIR="$dir"
 EOF
 
-  # Activate and persist
-  _cluster_activate "$dir"
+  # Note: we deliberately do NOT _cluster_activate here. Cluster identity
+  # lives in the tmux session (via setenv below + the first window sourcing
+  # join.sh). The launching shell stays clean — that way, when the user
+  # detaches from tmux or runs cluster-leave, no stale CLUSTER_DIR lingers.
 
   # Seed notes.txt
   cat > "$dir/notes.txt" <<EOF
@@ -115,13 +125,12 @@ this in cluster notes", or similar:
      triggered. -->
 AGENTSEOF
 
-  echo "Cluster initialized: $CLUSTER_DIR"
-  echo "tmux session: $name"
-  echo "Notes: $CLUSTER_DIR/notes.txt"
+  echo "Cluster initialized."
+  _cluster_print_summary "$name" "$dir" "starting" "$dir/notes.txt"
 
   # Start the tmux session detached, with the first window sourcing join.sh
   # (which sets CLUSTER_DIR) and then opening notes.txt in nano.
-  tmux new-session -d -s "$name" -x 220 -y 50 \; \
+  tmux new-session -d -s "$name" "${CLUSTER_TMUX_GEOMETRY[@]}" \; \
     send-keys "source \"$dir/join.sh\" && nano \"$dir/notes.txt\"" Enter
 
   # Stamp the tmux session env so new panes/windows inherit CLUSTER_DIR
@@ -133,31 +142,181 @@ AGENTSEOF
 }
 
 # ── cluster-join ─────────────────────────────────────────────────────────────
-# Usage: cluster-join [cluster-dir]
-# Join a cluster in the current shell — sets $CLUSTER_DIR and activates
-# history logging. Does NOT open a new window or attach to tmux.
-# Use nn or cluster-reopen to get into the tmux session.
+# Usage: cluster-join
+# Shows all clusters (most recent first). Pick one to attach to its tmux
+# session. If the session is not running, prompts to resurrect it before
+# attaching — never silently. CLUSTER_DIR is set in the tmux session env,
+# not in the calling shell.
 function cluster-join() {
-  local dir="${1:-}"
-  if [[ -z "$dir" ]]; then
-    local -a _matches
-    _matches=($CLUSTER_BASE/*/(Nom))
-    dir="${_matches[1]%/}"
-  fi
-  if [[ ! -d "$dir" ]]; then
-    echo "cluster-join: no cluster found at '${dir:-<none>}'" >&2
+  local -a clusters
+  clusters=($CLUSTER_BASE/*/(Nom))
+  if [[ ${#clusters[@]} -eq 0 ]]; then
+    echo "cluster-join: no clusters to join" >&2
+    echo "  hint: cluster-init [slug]" >&2
     return 1
   fi
-  _cluster_source_join cluster-join "$dir" || return 1
-  _cluster_activate "$CLUSTER_DIR"
-  # If the cluster's tmux session is running, refresh its env so panes split
-  # inside it (Ctrl-a ") inherit CLUSTER_DIR. cluster-join only sets the var
-  # in *this* shell; the tmux session env is independent and would otherwise
-  # carry whatever the server had cached when the session was created.
-  _cluster_refresh_tmux_env
-  echo "Joined cluster: $CLUSTER_DIR"
+
+  echo "Available clusters:"
+  local i=1
+  for c in "${clusters[@]}"; do
+    local cname="${${c%/}:t}"
+    local cdir="${c%/}"
+    if [[ "$cdir" == "$CLUSTER_DIR" ]]; then
+      printf "  %d) %s  ← active\n" "$i" "$cname"
+    else
+      printf "  %d) %s\n" "$i" "$cname"
+    fi
+    (( i++ ))
+  done
+
+  printf "Select cluster [1]: "
+  read -r selection
+  selection="${selection:-1}"
+  if [[ ! "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > ${#clusters[@]} )); then
+    echo "cluster-join: invalid selection '$selection' (expected 1-${#clusters[@]})" >&2
+    return 1
+  fi
+
+  local dir="${clusters[$selection]%/}"
+  if [[ ! -d "$dir" ]]; then
+    echo "cluster-join: invalid selection" >&2
+    return 1
+  fi
+
+  # Sanity check: cluster dir is intact. We need join.sh either to attach
+  # to a live session or to bootstrap a resurrected one, so check up front.
+  if [[ ! -f "$dir/join.sh" ]]; then
+    echo "cluster-join: $dir/join.sh missing — cluster dir looks corrupted" >&2
+    return 1
+  fi
+
+  # Probe for a live session. If none, prompt the user — cluster-join doesn't
+  # silently self-heal, but it offers an explicit one-keystroke resurrect so
+  # you're not bounced back to the shell to type a tmux incantation.
+  local name="${dir:t}"
+  if ! tmux has-session -t "$name" 2>/dev/null; then
+    echo "cluster-join: tmux session '$name' is not running." >&2
+    printf "Resurrect it now? [y/N]: " >&2
+    local _reply
+    read -r _reply
+    if [[ ! "$_reply" =~ ^[Yy]$ ]]; then
+      echo "cluster-join: aborted." >&2
+      return 1
+    fi
+    # Resurrect: start a detached session that sources join.sh in window 1,
+    # mirroring cluster-init's bootstrap (minus the nano-on-notes.txt step,
+    # which is a one-time startup nicety).
+    if ! tmux new-session -d -s "$name" -c "$dir" \
+           "${CLUSTER_TMUX_GEOMETRY[@]}" \; \
+           send-keys "source \"$dir/join.sh\"" Enter 2>/dev/null; then
+      echo "cluster-join: failed to create tmux session '$name'" >&2
+      return 1
+    fi
+  fi
+
+  # Refresh tmux session env so shells spawned inside the session get
+  # CLUSTER_DIR. We deliberately do NOT export CLUSTER_DIR in this shell —
+  # the launching shell stays clean so detach lands you in a plain shell
+  # with no stale cluster state.
+  tmux setenv -t "$name" CLUSTER_DIR "$dir"
+
+  echo "Joined cluster."
+  _cluster_print_summary "$name" "$dir" "running"
+  _cluster_tmux_attach "$name"
 }
 
+# ── cluster-rename ────────────────────────────────────────────────────────────
+# Usage: cluster-rename [new-slug]
+# Renames the active cluster's slug, keeping the timestamp prefix.
+# Updates the directory, join.sh, notes.txt header, tmux session name,
+# and shell state. Warns about stale shells/panes.
+function cluster-rename() {
+  _cluster_require_active cluster-rename || return 1
+
+  # Step 1: input + validate
+  local new_slug="${1:-}"
+  if [[ -z "$new_slug" ]]; then
+    printf "New slug: "
+    read -r new_slug
+  fi
+  if [[ -z "$new_slug" ]]; then
+    echo "cluster-rename: slug cannot be empty" >&2
+    return 1
+  fi
+  if [[ "$new_slug" =~ [^a-zA-Z0-9_-] ]]; then
+    echo "cluster-rename: slug must contain only letters, digits, hyphens, and underscores" >&2
+    return 1
+  fi
+
+  # Step 2: derive names + collision check
+  local old_name="${CLUSTER_DIR:t}"
+  local timestamp
+  timestamp="$(echo "$old_name" | cut -d- -f1-4)"
+  local new_name="${timestamp}-${new_slug}"
+  local new_dir="${CLUSTER_BASE}/${new_name}"
+
+  if [[ "$new_name" == "$old_name" ]]; then
+    echo "cluster-rename: new name is identical to current name" >&2
+    return 1
+  fi
+  if [[ -d "$new_dir" ]]; then
+    echo "cluster-rename: '$new_name' already exists" >&2
+    return 1
+  fi
+  if tmux has-session -t "$new_name" 2>/dev/null; then
+    echo "cluster-rename: tmux session '$new_name' already exists" >&2
+    return 1
+  fi
+
+  # Step 3: mv first — abort before touching anything else on failure
+  mv "$CLUSTER_DIR" "$new_dir" || {
+    echo "cluster-rename: mv failed — no changes made" >&2
+    return 1
+  }
+
+  # Step 4: rewrite join.sh via temp file
+  local tmp
+  tmp="$(mktemp "$new_dir/join.sh.XXXXXX")"
+  if echo "export CLUSTER_DIR=\"$new_dir\"" > "$tmp" && mv "$tmp" "$new_dir/join.sh"; then
+    : # success
+  else
+    rm -f "$tmp"
+    echo "cluster-rename: failed to update join.sh (directory renamed to $new_name)" >&2
+    return 1
+  fi
+
+  # Step 5: update notes.txt header + verify
+  sed -i '' "s/^# cluster: .*/# cluster: ${new_name}/" "$new_dir/notes.txt" 2>/dev/null
+  if ! grep -q "^# cluster: ${new_name}" "$new_dir/notes.txt" 2>/dev/null; then
+    echo "cluster-rename: warning — notes.txt header not updated (edit manually if needed)" >&2
+  fi
+
+  # Step 6: update shell state
+  _cluster_activate "$new_dir"
+
+  # Steps 7 + 8: rename tmux session and update its env (both inside the guard)
+  if tmux has-session -t "$old_name" 2>/dev/null; then
+    if tmux rename-session -t "$old_name" "$new_name" 2>/dev/null; then
+      tmux setenv -t "$new_name" CLUSTER_DIR "$new_dir"
+    else
+      echo "cluster-rename: warning — tmux session rename failed." >&2
+      echo "  Session is still named '$old_name'. To fix:" >&2
+      echo "  tmux rename-session -t '$old_name' '$new_name'" >&2
+    fi
+  fi
+
+  # Step 9: success + stale-shell warning
+  local tmux_state="not running"
+  tmux has-session -t "$new_name" 2>/dev/null && tmux_state="running"
+  echo "Renamed: $old_name → $new_name"
+  _cluster_print_summary "$new_name" "$new_dir" "$tmux_state"
+  echo
+  echo "Warning: every open shell/pane — including existing tmux panes — still has"
+  echo "  the old path. History logging has stopped in those shells."
+  echo "  Run in each:  source \"$new_dir/join.sh\""
+}
+
+# ── _cluster_refresh_tmux_env (internal) ─────────────────────────────────────
 # Update the active cluster's tmux session env (if running) to match the
 # current $CLUSTER_DIR. Safe to call from any context — no-op when no session.
 function _cluster_refresh_tmux_env() {
@@ -168,119 +327,6 @@ function _cluster_refresh_tmux_env() {
   fi
 }
 
-# ── cluster-activate ─────────────────────────────────────────────────────────
-# Usage: cluster-activate [name-fragment]
-# Re-activate a cluster's $CLUSTER_DIR in the current shell.
-# Does NOT open windows or attach to tmux. Use cluster-reopen after this
-# if you want to re-enter the tmux session.
-# No arg = interactive pick. With arg = most recent name match.
-function cluster-activate() {
-  local query="${1:-}"
-  local dir=""
-
-  if [[ -n "$query" ]]; then
-    local -a _matches
-    _matches=($CLUSTER_BASE/*${query}*/(Nom))
-    dir="${_matches[1]%/}"
-    if [[ ! -d "$dir" ]]; then
-      echo "cluster-activate: no cluster matching '$query'" >&2
-      cluster-list
-      return 1
-    fi
-  else
-    local -a clusters
-    clusters=($CLUSTER_BASE/*/(Nom))
-    if [[ ${#clusters[@]} -eq 0 ]]; then
-      echo "No clusters found in $CLUSTER_BASE" >&2
-      return 1
-    fi
-    echo "Available clusters:"
-    local i=1
-    for c in "${clusters[@]}"; do
-      printf "  %d) %s\n" "$i" "${${c%/}:t}"
-      (( i++ ))
-    done
-    printf "Select cluster [1]: "
-    read -r selection
-    selection="${selection:-1}"
-    if [[ ! "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > ${#clusters[@]} )); then
-      echo "cluster-activate: invalid selection '$selection' (expected 1-${#clusters[@]})" >&2
-      return 1
-    fi
-    dir="${clusters[$selection]%/}"
-    if [[ ! -d "$dir" ]]; then
-      echo "cluster-activate: invalid selection" >&2
-      return 1
-    fi
-  fi
-
-  _cluster_source_join cluster-activate "$dir" || return 1
-  _cluster_activate "$CLUSTER_DIR"
-  # See _cluster_refresh_tmux_env above — keeps split-panes consistent.
-  _cluster_refresh_tmux_env
-  echo "Activated cluster: $CLUSTER_DIR"
-  echo "Notes: $CLUSTER_DIR/notes.txt"
-  echo "Tip: run 'cluster-reopen' to attach to the tmux session."
-}
-
-# ── cluster-reopen ────────────────────────────────────────────────────────────
-# Usage: cluster-reopen [cluster-dir-or-name]
-# Attach to the tmux session for the active (or specified) cluster.
-# If the tmux session no longer exists (e.g. after reboot), tmux-continuum
-# will have already restored it on tmux server start. If it still doesn't
-# exist, a new session is created with the cluster's name and CLUSTER_DIR set.
-function cluster-reopen() {
-  local dir="${1:-$CLUSTER_DIR}"
-
-  if [[ -z "$dir" ]]; then
-    echo "cluster-reopen: no active cluster. Run: cluster-reopen <name-fragment>  or: cluster-activate <name-fragment> && cluster-reopen" >&2
-    return 1
-  fi
-
-  # Accept either a path or a bare session name
-  if [[ ! -d "$dir" ]]; then
-    # If no fragment was passed, the stale $CLUSTER_DIR is the problem —
-    # do not silently fall through to a different cluster.
-    if [[ -z "$1" ]]; then
-      echo "cluster-reopen: active cluster dir is missing: $CLUSTER_DIR" >&2
-      echo "Stale state cleared. Run 'cluster-activate <fragment>' to pick another." >&2
-      unset CLUSTER_DIR
-      rm -f "$CLUSTER_STATE"
-      return 1
-    fi
-    # Maybe it's a name fragment — try to find the cluster dir
-    local -a _matches
-    _matches=($CLUSTER_BASE/*${1}*/(Nom))
-    dir="${_matches[1]%/}"
-  fi
-
-  if [[ ! -d "$dir" ]]; then
-    echo "cluster-reopen: no cluster found at '$1'" >&2
-    return 1
-  fi
-
-  # Activate in current shell
-  _cluster_source_join cluster-reopen "$dir" || return 1
-  _cluster_activate "$CLUSTER_DIR"
-
-  # Derive tmux session name from the cluster dir basename
-  local name="$(basename "$dir")"
-
-  # Check if tmux session exists
-  if tmux has-session -t "$name" 2>/dev/null; then
-    echo "Attaching to existing tmux session: $name"
-    # Refresh session env (continuum-restored sessions may not have CLUSTER_DIR)
-    tmux setenv -t "$name" CLUSTER_DIR "$dir"
-    _cluster_tmux_attach "$name"
-  else
-    echo "tmux session '$name' not found — creating fresh session."
-    echo "(tmux-continuum should have restored it; if not, the session was never saved.)"
-    tmux new-session -d -s "$name" -x 220 -y 50 \; \
-      send-keys "source \"$dir/join.sh\"" Enter
-    tmux setenv -t "$name" CLUSTER_DIR "$dir"
-    _cluster_tmux_attach "$name"
-  fi
-}
 
 # ── _cluster_tmux_attach (internal) ──────────────────────────────────────────
 # Attach to a tmux session using the appropriate method for the terminal.
@@ -308,10 +354,7 @@ function _cluster_tmux_attach() {
 # Creates a new tmux window in the active session, already joined to the cluster.
 # Falls back to opening a plain terminal window if not inside tmux.
 function nn() {
-  if [[ -z "$CLUSTER_DIR" ]]; then
-    echo "nn: no active cluster (start one with: cluster-init [slug])" >&2
-    return 1
-  fi
+  _cluster_require_active nn || return 1
 
   local join_cmd="source \"$CLUSTER_DIR/join.sh\""
   local name="$(basename "$CLUSTER_DIR")"
@@ -324,7 +367,8 @@ function nn() {
     # a fresh terminal window and attach. Attach alone does NOT create a
     # window; we have to call new-window explicitly.
     if ! tmux has-session -t "$name" 2>/dev/null; then
-      echo "nn: tmux session '$name' is not running. Start it with: cluster-reopen" >&2
+      echo "nn: tmux session '$name' is not running" >&2
+      echo "  hint: cluster-join" >&2
       return 1
     fi
     tmux new-window -t "$name" \; send-keys -t "$name" "$join_cmd" Enter
@@ -348,8 +392,8 @@ end tell
 APPLESCRIPT
         ;;
       *)
-        echo "nn: created new tmux window in '$name'. Attach with:" >&2
-        echo "  tmux attach-session -t ${name}" >&2
+        echo "Created new tmux window in '$name'. Attach with:"
+        echo "  tmux attach-session -t ${name}"
         ;;
     esac
   fi
@@ -376,6 +420,7 @@ function _cluster_require_active() {
   local caller="$1"
   if [[ -z "$CLUSTER_DIR" ]]; then
     echo "${caller}: no active cluster" >&2
+    echo "  hint: cluster-init [slug]" >&2
     return 1
   fi
   if [[ ! -d "$CLUSTER_DIR" ]]; then
@@ -384,6 +429,12 @@ function _cluster_require_active() {
   fi
 }
 
+# ── notes ────────────────────────────────────────────────────────────────────
+# Usage: notes
+# Open the active cluster's notes.txt in nano. Companion to cluster-note
+# (append a timestamped entry) and cluster-notes (print to stdout).
+# The short `notes` alias is intentional; the cluster-* pair is what AI
+# agents use per AGENTS.md.
 function notes() {
   _cluster_require_active notes || return
   nano "$CLUSTER_DIR/notes.txt"
@@ -397,7 +448,8 @@ function cluster-note() {
   _cluster_require_active cluster-note || return
   local text="$*"
   if [[ -z "$text" ]]; then
-    echo "usage: cluster-note \"<text>\"" >&2
+    echo "cluster-note: missing text argument" >&2
+    echo "  usage: cluster-note \"<text>\"" >&2
     return 2
   fi
   printf '[%s] %s\n\n' "$(date +'%Y-%m-%d %H:%M')" "$text" >> "$CLUSTER_DIR/notes.txt"
@@ -410,27 +462,110 @@ function cluster-notes() {
   cat "$CLUSTER_DIR/notes.txt"
 }
 
+# ── cluster-history ──────────────────────────────────────────────────────────
+# Usage: cluster-history
+# Print the active cluster's history.log (commands run in any cluster shell).
 function cluster-history() {
   _cluster_require_active cluster-history || return
   cat "$CLUSTER_DIR/history.log"
 }
 
+# ── cluster-status ───────────────────────────────────────────────────────────
+# Usage: cluster-status
+# Show the active cluster's name, path, and tmux session state.
 function cluster-status() {
   if [[ -n "$CLUSTER_DIR" ]]; then
     local name="$(basename "$CLUSTER_DIR")"
-    echo "Active cluster: $CLUSTER_DIR"
-    if tmux has-session -t "$name" 2>/dev/null; then
-      echo "tmux session '$name': running"
-    else
-      echo "tmux session '$name': not running (run cluster-reopen to attach)"
+    local tmux_state="not running"
+    tmux has-session -t "$name" 2>/dev/null && tmux_state="running"
+    _cluster_print_summary "$name" "$CLUSTER_DIR" "$tmux_state"
+    if [[ "$tmux_state" == "not running" ]]; then
+      echo
+      echo "hint: cluster-join"
     fi
   else
     echo "No active cluster"
+    echo
+    echo "hint: cluster-init [slug]"
   fi
 }
 
+# ── cluster-list ─────────────────────────────────────────────────────────────
+# Usage: cluster-list
+# List all clusters under $CLUSTER_BASE, most-recently-modified first,
+# marking the active one.
 function cluster-list() {
-  CLICOLOR=0 command ls -1t "$CLUSTER_BASE" 2>/dev/null || echo "No clusters yet"
+  local -a entries
+  entries=("${(@f)$(CLICOLOR=0 command ls -1t "$CLUSTER_BASE" 2>/dev/null)}")
+  if [[ ${#entries[@]} -eq 0 || -z "${entries[1]}" ]]; then
+    echo "No clusters yet"
+    echo
+    echo "hint: cluster-init [slug]"
+    return
+  fi
+  local active="${CLUSTER_DIR:t}"
+  for e in "${entries[@]}"; do
+    if [[ "$e" == "$active" ]]; then
+      printf "%s  ← active\n" "$e"
+    else
+      printf "%s\n" "$e"
+    fi
+  done
+}
+
+# ── cluster-leave ────────────────────────────────────────────────────────────
+# Usage: cluster-leave
+# Step away from the active cluster in this shell. Unsets CLUSTER_DIR so the
+# prompt, history hook, and nn all stop targeting the cluster. If this shell
+# is inside any tmux session, detaches the client too (session keeps running;
+# other clients/panes are unaffected). Notes and history are preserved —
+# rejoin any time with cluster-join.
+#
+# Only affects this shell + this tmux client. Other open shells/panes that
+# already have CLUSTER_DIR set are unchanged (same caveat as cluster-rename).
+function cluster-leave() {
+  # If this shell is inside any tmux session, detach the client and kill
+  # the current window so the user lands back in their original (non-tmux)
+  # terminal with a clean slate — no cluster context, no neighboring tmux
+  # window grabbed focus.
+  #
+  # Order matters: detach-client first, then kill-window. kill-window on
+  # the window hosting *this* shell terminates the shell, so anything after
+  # it never runs. detach-client doesn't kill the shell — it only disconnects
+  # the iTerm-side client — so subsequent commands still execute. We capture
+  # the window target up front because after detach there's no "current
+  # client" for tmux to resolve a target-less kill-window against.
+  if [[ -n "$TMUX" ]]; then
+    # precmd hook won't fire after we exit tmux — log the leave explicitly.
+    if [[ -n "$CLUSTER_DIR" && -w "$CLUSTER_DIR/history.log" ]]; then
+      print "[$(date +%H:%M:%S) shell:$$] cluster-leave (detach + kill-window)" \
+        >> "$CLUSTER_DIR/history.log"
+    fi
+    unset CLUSTER_DIR
+    local _win_target
+    _win_target="$(tmux display-message -p '#S:#I' 2>/dev/null)"
+    tmux detach-client
+    tmux kill-window -t "$_win_target" 2>/dev/null
+    return 0
+  fi
+
+  if [[ -z "$CLUSTER_DIR" ]]; then
+    echo "cluster-leave: no active cluster" >&2
+    return 1
+  fi
+
+  local dir="$CLUSTER_DIR"
+  local name="${dir:t}"
+  local tmux_state="not running"
+  tmux has-session -t "$name" 2>/dev/null && tmux_state="running"
+
+  unset CLUSTER_DIR
+
+  echo "Left cluster (this shell only)."
+  _cluster_print_summary "$name" "$dir" "$tmux_state"
+  echo
+  echo "Rejoin:    cluster-join"
+  echo "Note: existing shells/panes still have CLUSTER_DIR set."
 }
 
 # ── cluster-shutdown ──────────────────────────────────────────────────────────
@@ -441,20 +576,18 @@ function cluster-list() {
 # If called from inside the session being shut down, all tabs will close.
 # If called from outside the session, the session is killed silently.
 function cluster-shutdown() {
-  local dir="${CLUSTER_DIR:-}"
-
-  if [[ -z "$dir" ]]; then
+  if [[ -z "$CLUSTER_DIR" ]]; then
     echo "cluster-shutdown: no active cluster" >&2
+    echo "  hint: cluster-init [slug]" >&2
     return 1
   fi
 
+  local dir="$CLUSTER_DIR"
   local name="$(basename "$dir")"
 
   if ! tmux has-session -t "$name" 2>/dev/null; then
-    echo "cluster-shutdown: no running session found for '$name'."
-    echo "Clearing active cluster state."
+    echo "No running session for '$name'. Clearing active cluster state."
     unset CLUSTER_DIR
-    [[ -f "$CLUSTER_STATE" ]] && rm -f "$CLUSTER_STATE"
     return 0
   fi
 
@@ -467,13 +600,73 @@ function cluster-shutdown() {
     fi
   fi
 
-  echo "Shutting down cluster: $name"
-  echo "Notes and history preserved at: $dir"
-  echo "Run 'cluster-reopen <name-fragment>' to start a fresh session — e.g. cluster-reopen $(basename "$dir")"
-
   # Clear shell state before killing the session (in case we survive the kill)
   unset CLUSTER_DIR
-  [[ -f "$CLUSTER_STATE" ]] && rm -f "$CLUSTER_STATE"
 
-  tmux kill-session -t "$name" 2>/dev/null
+  if tmux kill-session -t "$name" 2>/dev/null; then
+    echo "Cluster shut down."
+    _cluster_print_summary "$name" "$dir" "stopped"
+    echo
+    echo "Notes and history preserved at: $dir"
+    echo "Run 'cluster-join' to select and enter a session."
+  else
+    echo "cluster-shutdown: failed to kill tmux session '$name'" >&2
+    return 1
+  fi
+}
+
+# ── cluster-help ─────────────────────────────────────────────────────────────
+# Usage: cluster-help
+# List all cluster commands with their usage signature and one-line summary.
+# Parses this file's own section-header convention — no hardcoded command list.
+# Convention: each public command is preceded by
+#   # ── <name> ────...
+#   # Usage: <signature>
+#   # <description line(s)>
+#   function <name>() { ... }
+function cluster-help() {
+  local src="$_CLUSTER_ZSH_PATH"
+  if [[ ! -f "$src" ]]; then
+    echo "cluster-help: cannot locate cluster.zsh (looked for: $src)" >&2
+    return 1
+  fi
+
+  echo "Cluster commands:"
+  echo
+  awk '
+    function flush(name,   usage, desc, i, l) {
+      usage = ""; desc = ""
+      for (i = 1; i <= n; i++) {
+        l = buf[i]
+        if (l ~ /^Usage:[[:space:]]*/) {
+          usage = l
+          sub(/^Usage:[[:space:]]*/, "", usage)
+        } else if (desc == "" && l != "" && l !~ /^──/) {
+          desc = l
+        }
+      }
+      if (usage == "") usage = name
+      printf "  %-30s  %s\n", usage, desc
+      n = 0
+    }
+    /^# ──/ {
+      n = 0
+      line = $0; sub(/^#[[:space:]]?/, "", line)
+      buf[++n] = line
+      next
+    }
+    /^#/ {
+      line = $0; sub(/^#[[:space:]]?/, "", line)
+      buf[++n] = line
+      next
+    }
+    /^function[[:space:]]+(cluster-[a-zA-Z0-9_-]+|nn|notes)[[:space:]]*\(\)/ {
+      name = $2
+      sub(/\(\).*/, "", name)
+      flush(name)
+      next
+    }
+    /^$/ { n = 0; next }
+    { n = 0 }
+  ' "$src"
 }

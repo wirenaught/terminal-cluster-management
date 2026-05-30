@@ -2,7 +2,7 @@
 
 A zsh + tmux workflow for keeping each task you work on isolated in its own
 named **cluster**: a directory, a tmux session, a notes file, and a command
-history log — all bound together and auto-restored across shell restarts.
+history log — all bound together and rejoinable on demand.
 
 If you regularly juggle several pieces of work in parallel and lose track of
 which terminal tabs belong to which task, this is for you.
@@ -29,8 +29,11 @@ Anything you do while `CLUSTER_DIR` is set gets logged. Anything you open with
 `nn` becomes a tab in the cluster's tmux session. The prompt shows you the
 cluster name in blue brackets so you never have to guess.
 
-The currently active cluster is persisted in `~/.config/cluster/last-cluster`,
-so a new shell auto-restores the last one you were on.
+Activation is **shell-local and explicit**: a shell is "in" a cluster only if
+it joined one (via `cluster-init`, `cluster-join`, or by being spawned inside
+the cluster's tmux session). New terminal windows (`cmd-t`) start clean — no
+silent restoration. To get back into a cluster from a fresh shell, run
+`cluster-join`.
 
 ---
 
@@ -64,11 +67,11 @@ nn
 # Edit cluster notes any time:
 notes
 
-# Done for the day — just close the terminal. State is saved.
-# Next shell auto-restores CLUSTER_DIR.
+# Done for the day — just close the terminal. tmux session keeps running.
+# Next shell starts clean (no cluster). To pick back up:
 
-# Come back to it:
-cluster-reopen auth-bug
+# Come back to it (interactive picker, defaults to most recent):
+cluster-join
 ```
 
 That's it. Read on for the full command set and workflows.
@@ -80,13 +83,13 @@ That's it. Read on for the full command set and workflows.
 | Command | What it does |
 |---|---|
 | `cluster-init [slug]` | Create a new cluster dir, start a named tmux session, open `notes.txt`, attach |
-| `cluster-join [dir]` | Join a cluster in the **current shell only** (sets `$CLUSTER_DIR`, no tmux). Defaults to most recent cluster |
-| `cluster-activate [name-fragment]` | Like `cluster-join`, but interactive picker when no arg is given. Use before `cluster-reopen` |
-| `cluster-reopen [name-fragment]` | Attach to the tmux session for the active or named cluster. Creates a fresh session if continuum hasn't restored one |
-| `cluster-shutdown` | Kill the active cluster's tmux session and clear `$CLUSTER_DIR` + the auto-restore state file. Notes and history are preserved on disk |
+| `cluster-join` | Numbered interactive list of all clusters (most recent first, active cluster marked). Pick one to attach to its tmux session. If the session isn't running, prompts `Resurrect it now? [y/N]` — `y` recreates the session and attaches, anything else aborts. `$CLUSTER_DIR` lands in shells spawned inside the session, not in the calling shell |
+| `cluster-leave` | Step away from the active cluster in this shell. Unsets `$CLUSTER_DIR`; if this client is attached to the cluster's tmux session, also detaches it (session keeps running, other clients/panes unaffected). On-disk artifacts untouched |
+| `cluster-shutdown` | Kill the active cluster's tmux session and clear `$CLUSTER_DIR`. Notes and history are preserved on disk |
 | `cluster-list` | List all clusters under `~/.clusters/`, most recent first |
 | `cluster-status` | Show active cluster and whether its tmux session is running |
 | `cluster-history` | Print the active cluster's `history.log` |
+| `cluster-help` | List all cluster commands with usage signatures and one-line summaries (parsed from `cluster.zsh` itself) |
 | `notes` | Open the active cluster's `notes.txt` in nano |
 | `cluster-note "<text>"` | Append a timestamped entry to the cluster's `notes.txt` — usable by you or by AI agents (see [AI integration](#ai-integration)) |
 | `cluster-notes` | Print the cluster's `notes.txt` to stdout (use `notes` if you want to edit instead) |
@@ -96,12 +99,10 @@ That's it. Read on for the full command set and workflows.
 
 `cluster-init` names the cluster `YYYY-MM-DD-HHMM` plus an optional `-slug`,
 e.g. `2026-05-25-1430-auth-bug`. The directory basename **is** the tmux session
-name — that's what `tmux-resurrect` saves. `cluster-reopen` greps your query
-against the full cluster paths output by `ls -td ~/.clusters/*/`.
+name — that's what `tmux-resurrect` saves.
 
-Anywhere a command takes `[name-fragment]`, it does a substring match against
-the directory basename and picks the most recent hit. Use enough characters to
-disambiguate, or use the interactive picker (`cluster-activate` with no arg).
+`cluster-join` always shows the full interactive picker (numbered list, most
+recent first). Default selection `[1]` picks the most recent cluster.
 
 ---
 
@@ -131,23 +132,23 @@ The old cluster's tmux session stays running. The new shell is now bound to the
 new cluster. To go back to the previous one:
 
 ```zsh
-cluster-reopen fix-login-redirect
+cluster-join
 ```
 
 ### Coming back after a reboot
 
 `tmux-continuum` automatically restarts the tmux server on login and restores
-saved sessions, so:
+saved sessions. Your shells start clean (no auto-restore of `$CLUSTER_DIR`),
+so when you're ready to resume:
 
 ```zsh
-# New shell starts. CLUSTER_DIR is auto-restored from the state file.
-cluster-status        # confirms which cluster, whether session is running
-cluster-reopen        # attaches to it
+cluster-join          # pick from the list — attaches to the live session
 ```
 
-If continuum hasn't run yet (e.g. you logged in but didn't open a terminal for
-a while), `cluster-reopen` creates a fresh session with the same name — your
-notes and history are still there, just the live tmux state is gone.
+If continuum hasn't restored the session yet (or never saved it),
+`cluster-join` notices and asks `Resurrect it now? [y/N]`. Answer `y` and it
+recreates the tmux session (sourcing `join.sh` in window 1) and attaches.
+Notes and history are still on disk; only the live tmux state was missing.
 
 ### Wrapping up a task for good
 
@@ -156,15 +157,21 @@ cluster-shutdown
 ```
 
 The tmux session is killed; the directory, `notes.txt`, and `history.log` are
-preserved. To revive it later for reference:
+preserved. To revive it later, run `cluster-join` and pick it — it'll notice
+the session is gone and prompt to resurrect it on the spot.
+
+### Stepping away without shutting down
 
 ```zsh
-cluster-activate fix-login-redirect    # sets CLUSTER_DIR
-cluster-history                        # browse what you ran
-notes                                  # browse what you wrote
+cluster-leave
 ```
 
-To revive it as a live working session, `cluster-reopen <name>` instead.
+Unsets `$CLUSTER_DIR` in this shell. If you're inside the cluster's tmux
+session, also detaches this client — your terminal returns to a plain shell
+and stops showing tmux. The session itself keeps running and other
+clients/panes are unaffected. Useful when you want a clean shell for
+unrelated work but aren't done with the cluster. Rejoin any time with
+`cluster-join`.
 
 ### Joining an existing cluster in one extra shell
 
@@ -172,12 +179,16 @@ You opened a new terminal tab outside tmux but want it logged to the active
 cluster:
 
 ```zsh
-cluster-join          # most recent cluster
-# or
-cluster-join ~/.clusters/2026-05-25-1430-auth-bug
+cluster-join          # interactive picker — default [1] selects most recent
 ```
 
-This only sets `$CLUSTER_DIR` and starts logging — it doesn't touch tmux.
+This activates `$CLUSTER_DIR`, starts logging, and attaches to the cluster's
+tmux session. If you want to join a cluster for logging only without
+touching tmux, source its `join.sh` directly:
+
+```zsh
+source ~/.clusters/2026-05-25-1430-auth-bug/join.sh
+```
 
 ---
 
@@ -192,21 +203,29 @@ This only sets `$CLUSTER_DIR` and starts logging — it doesn't touch tmux.
     AGENTS.md         # per-cluster instructions for AI tools (see AI integration)
   2026-05-24-0915-other-thing/
     ...
-
-~/.config/cluster/
-  last-cluster        # path to the most recently active cluster
 ```
 
 **`CLUSTER_DIR`** is the single source of truth for "which cluster is this
-shell on." It's set by:
+shell on." Under the current model, `cluster-init` and `cluster-join` do
+**not** export `CLUSTER_DIR` in the calling shell — they only set it in the
+tmux session env. The variable lands in your shell when:
 
-- `cluster-init` (new cluster)
-- `cluster-join` / `cluster-activate` / `cluster-reopen` (existing cluster)
-- The auto-restore block at the top of `cluster.zsh` (new shell startup)
-- `source $CLUSTER_DIR/join.sh` (manual or from a fresh tmux window via `nn`)
+- A new tmux window/pane opens inside a cluster session (tmux propagates the
+  session env to spawned shells).
+- You `source $CLUSTER_DIR/join.sh` manually (the only way to put a non-tmux
+  shell into a cluster).
 
-**`last-cluster`** is rewritten every time `_cluster_activate` runs. It's how
-new shells know what to restore. `cluster-shutdown` removes it.
+And it is unset by:
+
+- `cluster-leave` (this shell only; also detaches if you're inside the
+  cluster's tmux session).
+- `cluster-shutdown` (this shell; tmux session is killed).
+
+There is **no persistent state file** and **no auto-restore**. A fresh
+terminal starts with no `$CLUSTER_DIR` and stays clean until you explicitly
+`cluster-join` (which attaches you to the existing tmux session). The
+trade-off vs the previous auto-restore design: you run one extra command
+after a reboot to re-attach, but `cmd-t` is never surprising.
 
 ### History logging
 
@@ -256,9 +275,9 @@ need to paste — no AppleScript automation.
 
 ## AI integration
 
-Because `$CLUSTER_DIR` is exported in every cluster-joined shell, any AI tool
-you launch from that shell (Claude Code, OpenCode, etc.) inherits it. That's
-the only wiring needed — discovery is free.
+Because `$CLUSTER_DIR` is set in every shell spawned inside a cluster's
+tmux session, any AI tool you launch from that shell (Claude Code, OpenCode,
+etc.) inherits it. That's the only wiring needed — discovery is free.
 
 Two pieces give AI tools a clean protocol for the notes file:
 
@@ -294,20 +313,18 @@ carries its own `$CLUSTER_DIR`.
 
 ## Troubleshooting
 
-**`cluster-reopen` says "tmux session not found"**
-Continuum didn't restore the session (either it was never saved, the resurrect
-file is missing, or you ran `cluster-reopen` before continuum kicked in). The
-command creates a fresh empty session with the same name — your notes and
-history are intact. Re-open whatever windows you need with `nn`.
+**`cluster-join` prompts to resurrect a session**
+When the saved tmux session is gone (after `cluster-shutdown`, a reboot
+before continuum saved, or a crash), `cluster-join` asks `Resurrect it now?
+[y/N]` instead of silently recreating it. Answer `y` to recreate and attach;
+anything else aborts. Notes and history on disk are untouched either way.
 
-**The prompt isn't showing the cluster name**
-Check `echo $CLUSTER_DIR`. If empty, the auto-restore didn't fire (state file
-missing, or its target directory is gone). Run `cluster-activate <fragment>`
-to pick one. If the target directory was deleted out from under it, the stale
-state file at `~/.config/cluster/last-cluster` is left in place — clear it
-with `rm ~/.config/cluster/last-cluster`. If `CLUSTER_DIR` is set but the
-prompt is blank, confirm `setopt PROMPT_SUBST` is in effect — another
-`.zshrc` line may be overwriting `PROMPT` after `cluster.zsh` is sourced.
+**The prompt isn't showing the cluster name in a new terminal**
+That's expected. New shells (`cmd-t`) start with no `$CLUSTER_DIR` — there's
+no persistent state. Run `cluster-join` to pick from the interactive list.
+If `cluster-join` set `$CLUSTER_DIR` but the prompt is still blank, confirm
+`setopt PROMPT_SUBST` is in effect — another `.zshrc` line may be overwriting
+`PROMPT` after `cluster.zsh` is sourced.
 
 **`nn` opens a new window outside the cluster**
 You're outside tmux *and* outside iTerm2/Apple Terminal. `nn` only knows how
